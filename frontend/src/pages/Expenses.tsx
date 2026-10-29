@@ -100,7 +100,6 @@ export default function Expenses() {
                             {e.payment_method && ` · ${paymentLabel(e)}`}
                             {e.recurring_id && <span className="tag">🔁 recurring</span>}
                             {e.loan_id && <span className="tag">🏦 EMI</span>}
-                            {e.has_receipt && <span className="tag">📎</span>}
                           </span>
                         </span>
                         <span className="tx-amt">{formatINR(e.amount)}</span>

@@ -1,13 +1,12 @@
 from fastapi import APIRouter, FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
-from mangum import Mangum
 
 from .config import get_settings
 from .routers import auth, budgets, cards, categories, expenses, insights, loans, recurring
 
 app = FastAPI(
     title="spend-a-thon API",
-    version="1.0.0",
+    version="2.0.0",
     docs_url="/api/docs",
     openapi_url="/api/openapi.json",
     redoc_url=None,
@@ -42,5 +41,3 @@ for r in (auth.router, expenses.router, budgets.router, recurring.router, catego
     api.include_router(r)
 
 app.include_router(api)
-
-handler = Mangum(app, lifespan="off")

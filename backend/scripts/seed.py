@@ -1,6 +1,6 @@
 """Load categories, credit cards and loans into your spend-a-thon account through the API.
 
-    python scripts/seed.py https://your-site.cloudfront.net you@example.com [path/to/seed.json]
+    python scripts/seed.py https://spend-a-thon.vercel.app you@example.com [path/to/seed.json]
 
 Prompts for your password. Safe to re-run: anything with the same name already in
 your account (category label, card name, lender + taken-by + amount) is skipped.

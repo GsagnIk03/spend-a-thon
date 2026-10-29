@@ -1,6 +1,5 @@
 node_modules/
 dist/
-.aws-sam/
 __pycache__/
 *.pyc
 .pytest_cache/
@@ -8,7 +7,13 @@ __pycache__/
 .env
 .env.*
 .DS_Store
-samconfig.toml
 
 # personal seed data - never commit
 backend/scripts/seed.json
+
+# generated in CI by Capacitor
+frontend/android/
+frontend/ios/
+*.apk
+*.jks
+*.keystore
