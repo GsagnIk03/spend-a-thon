@@ -1,0 +1,7 @@
+# Python dependencies for the API (Vercel installs these from the repo root)
+fastapi>=0.115,<0.116
+pydantic>=2.8,<3
+PyJWT>=2.9,<3
+tzdata>=2024.1
+SQLAlchemy>=2.0,<2.1
+psycopg[binary]>=3.2,<4
