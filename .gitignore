@@ -1,0 +1,14 @@
+node_modules/
+dist/
+.aws-sam/
+__pycache__/
+*.pyc
+.pytest_cache/
+.venv/
+.env
+.env.*
+.DS_Store
+samconfig.toml
+
+# personal seed data - never commit
+backend/scripts/seed.json

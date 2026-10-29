@@ -1,0 +1,24 @@
+{
+  "_comment": "Copy to seed.json (git-ignored), edit, then run: python scripts/seed.py https://your-site you@example.com",
+  "categories": [
+    { "label": "Cigarettes", "emoji": "🚬" },
+    { "label": "Tea & Snacks", "emoji": "☕" }
+  ],
+  "cards": [
+    {
+      "name": "HDFC Millennia", "bank": "HDFC Bank", "last4": "1234",
+      "credit_limit": 100000, "available": 85000, "statement_day": 15, "due_day": 5
+    }
+  ],
+  "loans": [
+    {
+      "kind": "loan", "lender": "Example Bank", "taken_by": "Me", "principal": 100000,
+      "interest_rate": 14.0, "total_interest": 23000, "installment": 3420, "emi_count": 36,
+      "first_emi_date": "2026-01-05", "emi_day": 5, "insurance": true
+    },
+    {
+      "kind": "borrowing", "lender": "A Friend", "taken_by": "Me", "principal": 10000,
+      "repayments": [{ "amount": 2000, "date": "2026-10-01", "note": "First part" }]
+    }
+  ]
+}
