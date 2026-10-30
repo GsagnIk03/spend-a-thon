@@ -5,7 +5,7 @@ from typing import Annotated, Literal
 
 from pydantic import BaseModel, Field, field_validator, model_validator
 
-from .constants import CREDIT_CARD, PAYMENT_METHODS, RECEIPT_TYPES
+from .constants import CREDIT_CARD, PAYMENT_METHODS
 from .utils import is_month
 
 EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
@@ -142,25 +142,9 @@ class ExpenseOut(BaseModel):
     note: str
     payment_method: str | None
     card_id: str | None
-    has_receipt: bool
     recurring_id: str | None
     loan_id: str | None
     created_at: str | None
-
-
-class ReceiptUploadIn(BaseModel):
-    content_type: str
-
-    @field_validator("content_type")
-    @classmethod
-    def _ct(cls, v: str) -> str:
-        if v not in RECEIPT_TYPES:
-            raise ValueError("receipt must be a JPG, PNG, WEBP, HEIC image or a PDF")
-        return v
-
-
-class ReceiptAttachIn(BaseModel):
-    key: str = Field(max_length=300)
 
 
 # ---------- budgets ----------

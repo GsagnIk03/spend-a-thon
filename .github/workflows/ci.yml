@@ -1,0 +1,133 @@
+name: CI & Android app
+
+# Vercel deploys the site + API itself on every push to main (Git integration).
+# This workflow runs the tests and builds the Android app.
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: spendathon_test
+        ports: ['5432:5432']
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s --health-timeout 5s --health-retries 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+          cache-dependency-path: |
+            requirements.txt
+            backend/requirements-dev.txt
+      - name: Backend tests
+        working-directory: backend
+        env:
+          TEST_DATABASE_URL: postgresql+psycopg://postgres:postgres@localhost:5432/spendathon_test
+        run: |
+          pip install -r ../requirements.txt -r requirements-dev.txt
+          pytest -q
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - name: Frontend build
+        working-directory: frontend
+        run: |
+          npm ci
+          npm run build
+
+  android:
+    # A native shell around the live site, published as the "android-latest" GitHub
+    # Release so there is always one stable download link.
+    # Needs the repo variable SITE_URL (your Vercel URL, e.g. https://spend-a-thon.vercel.app).
+    needs: test
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main' && vars.SITE_URL != ''
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+      - uses: android-actions/setup-android@v3
+
+      - name: Generate native project
+        working-directory: frontend
+        env:
+          CAP_SERVER_URL: ${{ vars.SITE_URL }}
+        run: |
+          npm ci
+          npm run build
+          npx cap add android
+          npx @capacitor/assets generate --android
+          npx cap sync android
+          sed -i "s/versionCode 1$/versionCode ${{ github.run_number }}/; s/versionName \"1.0\"/versionName \"1.0.${{ github.run_number }}\"/" android/app/build.gradle
+
+      # Without a release keystore, keep the debug key stable between builds so new
+      # APKs install over old ones. (Caches expire after 7 unused days - set the
+      # ANDROID_KEYSTORE_* secrets for a permanent key; see README.)
+      - name: Reuse debug signing key
+        uses: actions/cache@v4
+        with:
+          path: ~/.android/debug.keystore
+          key: android-debug-keystore-v1
+
+      - name: Build APK
+        working-directory: frontend/android
+        env:
+          KEYSTORE_B64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          KS_PASS: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          KEY_PASS: ${{ secrets.ANDROID_KEY_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+        run: |
+          chmod +x gradlew
+          if [ -n "$KEYSTORE_B64" ]; then
+            echo "$KEYSTORE_B64" | base64 -d > "$RUNNER_TEMP/release.jks"
+            ./gradlew --no-daemon assembleRelease
+            BT=$(ls -d "$ANDROID_HOME"/build-tools/* | sort -V | tail -1)
+            "$BT/zipalign" -p -f 4 app/build/outputs/apk/release/app-release-unsigned.apk "$RUNNER_TEMP/aligned.apk"
+            "$BT/apksigner" sign --ks "$RUNNER_TEMP/release.jks" --ks-pass env:KS_PASS \
+              --key-pass env:KEY_PASS --ks-key-alias "${KEY_ALIAS:-spendathon}" \
+              --out "$GITHUB_WORKSPACE/spend-a-thon.apk" "$RUNNER_TEMP/aligned.apk"
+          else
+            echo "::warning::No ANDROID_KEYSTORE_BASE64 secret - building a debug-signed APK"
+            ./gradlew --no-daemon assembleDebug
+            cp app/build/outputs/apk/debug/app-debug.apk "$GITHUB_WORKSPACE/spend-a-thon.apk"
+          fi
+          ls -lh "$GITHUB_WORKSPACE/spend-a-thon.apk"
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SITE_URL: ${{ vars.SITE_URL }}
+        run: |
+          gh release delete android-latest --yes --cleanup-tag 2>/dev/null || true
+          gh release create android-latest spend-a-thon.apk \
+            --title "spend-a-thon for Android (build ${{ github.run_number }})" \
+            --notes "Install on Android: download spend-a-thon.apk on your phone and open it (allow installs from your browser when asked). Opens $SITE_URL." \
+            --target "${{ github.sha }}"
+          echo "### APK → https://github.com/${{ github.repository }}/releases/download/android-latest/spend-a-thon.apk" >> "$GITHUB_STEP_SUMMARY"

@@ -2,6 +2,7 @@ import type {
   AuthResponse, Card, CardInput, CardPayment, Category, Expense, ExpenseInput, Insights, Loan,
   LoanInput, LoansResponse, Meta, Recurring, RecurringInput, Summary, User,
 } from './types'
+import { saveFile } from './native'
 
 const TOKEN_KEY = 'spend-a-thon.token'
 
@@ -70,17 +71,6 @@ async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
 
 const json = (method: string, body: unknown): RequestInit => ({ method, body: JSON.stringify(body) })
 
-function saveBlob(blob: Blob, filename: string) {
-  const url = URL.createObjectURL(blob)
-  const a = document.createElement('a')
-  a.href = url
-  a.download = filename
-  document.body.appendChild(a)
-  a.click()
-  a.remove()
-  setTimeout(() => URL.revokeObjectURL(url), 1000)
-}
-
 export const api = {
   // auth
   register: (b: { name: string; email: string; password: string }) =>
@@ -98,24 +88,6 @@ export const api = {
   createExpense: (b: ExpenseInput) => request<Expense>('/expenses', json('POST', b)),
   updateExpense: (id: string, b: ExpenseInput) => request<Expense>(`/expenses/${id}`, json('PUT', b)),
   deleteExpense: (id: string) => request<void>(`/expenses/${id}`, { method: 'DELETE' }),
-
-  // receipts
-  async uploadReceipt(id: string, file: File): Promise<Expense> {
-    const type = file.type || (file.name.toLowerCase().endsWith('.heic') ? 'image/heic' : '')
-    const p = await request<{ url: string; fields: Record<string, string>; key: string }>(
-      `/expenses/${id}/receipt/upload-url`, json('POST', { content_type: type }),
-    )
-    const fd = new FormData()
-    Object.entries(p.fields).forEach(([k, v]) => fd.append(k, v))
-    fd.append('file', file)
-    const up = await fetch(p.url, { method: 'POST', body: fd })
-    if (!up.ok) {
-      throw new ApiError(up.status, up.status === 400 ? 'Receipt must be under 5 MB' : 'Receipt upload failed')
-    }
-    return request<Expense>(`/expenses/${id}/receipt`, json('PUT', { key: p.key }))
-  },
-  receiptUrl: (id: string) => request<{ url: string }>(`/expenses/${id}/receipt`),
-  deleteReceipt: (id: string) => request<Expense>(`/expenses/${id}/receipt`, { method: 'DELETE' }),
 
   // budgets
   getBudgets: () => request<{ budgets: Record<string, number> }>('/budgets'),
@@ -163,7 +135,7 @@ export const api = {
     const res = await raw(`/export?${new URLSearchParams({ start, end })}`)
     const cd = res.headers.get('Content-Disposition') ?? ''
     const name = /filename="([^"]+)"/.exec(cd)?.[1] ?? `expenses_${start}_to_${end}.csv`
-    saveBlob(await res.blob(), name)
+    await saveFile(await res.blob(), name)
   },
 }
 

@@ -1,92 +1,80 @@
-"""Data-access helpers shared by the routers.
-
-Single-table layout (all of a user's data lives under PK = USER#<id>):
-  USER#<id>   PROFILE              -> profile
-  EMAIL#<em>  EMAIL                -> email -> user lookup (+ password hash)
-  USER#<id>   EXP#<expenseId>      -> expense   (date_sk = <YYYY-MM-DD>#<id> on LSI "ByDate")
-  USER#<id>   BUDGET#<category>    -> monthly budget
-  USER#<id>   REC#<recurringId>    -> recurring expense template
-  USER#<id>   CAT#<categoryId>     -> custom category
-  USER#<id>   CARD#<cardId>        -> credit card (available_paise is kept up to date atomically)
-  USER#<id>   CPAY#<paymentId>     -> credit card bill payment / refund
-  USER#<id>   LOAN#<loanId>        -> loan (EMI) or borrowing, with its repayments
-"""
+"""Data-access helpers shared by the routers. Every function takes the request's
+connection (one transaction per request) and every query is scoped to `user_id`."""
 import datetime as dt
-import logging
 from collections import defaultdict
 
-from boto3.dynamodb.conditions import Attr, Key
-from botocore.exceptions import ClientError
 from fastapi import HTTPException
+from sqlalchemy import Connection, and_, func, select, update
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 from .constants import CATEGORIES, CATEGORY_IDS, CREDIT_CARD, MAX_RANGE_MONTHS
-from .db import get_table, query_all, user_pk
-from .utils import add_months, days_in_month, month_range, now_iso, to_rupees, today
-
-log = logging.getLogger(__name__)
+from .db import budgets, cards, categories, expenses, loan_repayments, loans, recurring
+from .utils import add_months, days_in_month, month_range, to_rupees, today
 
 
-def _items(user_id: str, prefix: str) -> list[dict]:
-    return query_all(
-        KeyConditionExpression=Key("PK").eq(user_pk(user_id)) & Key("SK").begins_with(prefix)
-    )
+def _iso(v) -> str | None:
+    if v is None:
+        return None
+    return v.isoformat()
 
 
-def _cancel_reasons(e: ClientError) -> list[str]:
-    return [r.get("Code", "") for r in e.response.get("CancellationReasons", [])]
+def _rows(result) -> list[dict]:
+    return [dict(r._mapping) for r in result]
+
+
+def _one(result) -> dict | None:
+    r = result.first()
+    return dict(r._mapping) if r else None
 
 
 # ======================= categories =======================
-def custom_categories(user_id: str) -> list[dict]:
-    items = sorted(_items(user_id, "CAT#"), key=lambda i: i.get("created_at", ""))
-    return [
-        {"id": i["id"], "label": i["label"], "emoji": i["emoji"], "color": i["color"], "custom": True}
-        for i in items
-    ]
+def custom_categories(conn: Connection, user_id: str) -> list[dict]:
+    rows = _rows(conn.execute(
+        select(categories).where(categories.c.user_id == user_id).order_by(categories.c.created_at)
+    ))
+    return [{"id": r["id"], "label": r["label"], "emoji": r["emoji"], "color": r["color"], "custom": True}
+            for r in rows]
 
 
-def all_categories(user_id: str) -> list[dict]:
+def all_categories(conn: Connection, user_id: str) -> list[dict]:
     defaults = [{**c, "custom": False} for c in CATEGORIES]
-    custom = custom_categories(user_id)
-    # keep "Other" last
-    return defaults[:-1] + custom + defaults[-1:]
+    return defaults[:-1] + custom_categories(conn, user_id) + defaults[-1:]  # keep "Other" last
 
 
-def category_labels(user_id: str) -> dict[str, str]:
-    return {c["id"]: c["label"] for c in all_categories(user_id)}
+def category_labels(conn: Connection, user_id: str) -> dict[str, str]:
+    return {c["id"]: c["label"] for c in all_categories(conn, user_id)}
 
 
-def check_category(user_id: str, category: str) -> None:
+def check_category(conn: Connection, user_id: str, category: str) -> None:
     if category in CATEGORY_IDS:
         return
-    if category.startswith("c_"):
-        got = get_table().get_item(Key={"PK": user_pk(user_id), "SK": f"CAT#{category}"}).get("Item")
-        if got:
-            return
-    raise HTTPException(422, "unknown category")
+    found = conn.execute(select(categories.c.id).where(
+        categories.c.id == category, categories.c.user_id == user_id)).first()
+    if not found:
+        raise HTTPException(422, "unknown category")
 
 
 # ======================= credit cards =======================
-def get_card(user_id: str, card_id: str) -> dict:
-    item = get_table().get_item(Key={"PK": user_pk(user_id), "SK": f"CARD#{card_id}"}).get("Item")
-    if not item:
+def get_card(conn: Connection, user_id: str, card_id: str) -> dict:
+    row = _one(conn.execute(select(cards).where(cards.c.id == card_id, cards.c.user_id == user_id)))
+    if not row:
         raise HTTPException(404, "Card not found")
-    return item
+    return row
 
 
-def list_cards(user_id: str) -> list[dict]:
-    return sorted(_items(user_id, "CARD#"), key=lambda c: c.get("created_at", ""))
+def list_cards(conn: Connection, user_id: str) -> list[dict]:
+    return _rows(conn.execute(select(cards).where(cards.c.user_id == user_id).order_by(cards.c.created_at)))
 
 
-def check_card(user_id: str, payment_method: str | None, card_id: str | None,
+def check_card(conn: Connection, user_id: str, payment_method: str | None, card_id: str | None,
                allow_archived: str | None = None) -> None:
     """A credit-card payment may name one of the user's (active) cards."""
     if payment_method != CREDIT_CARD or not card_id:
         return
-    item = get_table().get_item(Key={"PK": user_pk(user_id), "SK": f"CARD#{card_id}"}).get("Item")
-    if not item:
+    row = _one(conn.execute(select(cards.c.archived).where(cards.c.id == card_id, cards.c.user_id == user_id)))
+    if not row:
         raise HTTPException(422, "unknown credit card")
-    if item.get("archived") and card_id != allow_archived:
+    if row["archived"] and card_id != allow_archived:
         raise HTTPException(422, "that card has been removed")
 
 
@@ -97,8 +85,8 @@ def card_out(card: dict, month_spend: dict | None = None) -> dict:
     return {
         "id": card["id"],
         "name": card["name"],
-        "bank": card.get("bank", ""),
-        "last4": card.get("last4", ""),
+        "bank": card.get("bank") or "",
+        "last4": card.get("last4") or "",
         "credit_limit": to_rupees(limit),
         "available": to_rupees(available),
         "used": to_rupees(limit - available),
@@ -112,6 +100,16 @@ def card_out(card: dict, month_spend: dict | None = None) -> dict:
     }
 
 
+def adjust_card(conn: Connection, user_id: str, card_id: str, delta_paise: int) -> None:
+    if not delta_paise:
+        return
+    conn.execute(
+        update(cards)
+        .where(cards.c.id == card_id, cards.c.user_id == user_id)
+        .values(available_paise=cards.c.available_paise + delta_paise, updated_at=func.now())
+    )
+
+
 def _card_delta(old: dict | None, new: dict | None) -> dict[str, int]:
     """How much each card's available balance must change when `old` becomes `new`."""
     deltas: dict[str, int] = defaultdict(int)
@@ -122,137 +120,98 @@ def _card_delta(old: dict | None, new: dict | None) -> dict[str, int]:
     return {k: v for k, v in deltas.items() if v}
 
 
-def _card_updates(table_name: str, user_id: str, deltas: dict[str, int]) -> list[dict]:
-    return [
-        {
-            "Update": {
-                "TableName": table_name,
-                "Key": {"PK": user_pk(user_id), "SK": f"CARD#{cid}"},
-                "UpdateExpression": "ADD available_paise :d",
-                "ConditionExpression": "attribute_exists(PK)",
-                "ExpressionAttributeValues": {":d": delta},
-            }
-        }
-        for cid, delta in deltas.items()
-    ]
-
-
 # ======================= expenses =======================
-def build_expense_item(user_id: str, expense_id: str, *, amount_paise: int, date: str,
-                       category: str, note: str = "", payment_method: str | None = None,
-                       card_id: str | None = None, recurring_id: str | None = None,
-                       loan_id: str | None = None, receipt_key: str | None = None,
-                       created_at: str | None = None) -> dict:
-    item = {
-        "PK": user_pk(user_id),
-        "SK": f"EXP#{expense_id}",
-        "date_sk": f"{date}#{expense_id}",
-        "type": "expense",
+def build_expense(user_id: str, expense_id: str, *, amount_paise: int, date: str | dt.date,
+                  category: str, note: str = "", payment_method: str | None = None,
+                  card_id: str | None = None, recurring_id: str | None = None,
+                  loan_id: str | None = None) -> dict:
+    return {
         "id": expense_id,
+        "user_id": user_id,
         "amount_paise": amount_paise,
-        "date": date,
+        "date": dt.date.fromisoformat(date) if isinstance(date, str) else date,
         "category": category,
         "note": note,
-        "created_at": created_at or now_iso(),
-        "updated_at": now_iso(),
-    }
-    optional = {
         "payment_method": payment_method,
         "card_id": card_id if payment_method == CREDIT_CARD else None,
         "recurring_id": recurring_id,
         "loan_id": loan_id,
-        "receipt_key": receipt_key,
     }
-    item.update({k: v for k, v in optional.items() if v})
-    return item
 
 
-def save_expense(user_id: str, new: dict, old: dict | None = None, *, only_if_new: bool = False) -> bool:
-    """Write an expense and move the money on any credit card(s) in one transaction.
+def insert_expense(conn: Connection, user_id: str, new: dict, *, only_if_new: bool = False) -> dict | None:
+    """Insert an expense and take it off its credit card, in the request's transaction.
 
-    Returns False if `only_if_new` and the expense already existed.
+    With `only_if_new`, an existing id is left alone (returns None) - used for
+    auto-generated expenses so they're created exactly once.
     """
-    table = get_table()
-    put = {"TableName": table.name, "Item": new}
+    stmt = pg_insert(expenses).values(**new)
     if only_if_new:
-        put["ConditionExpression"] = "attribute_not_exists(PK)"
-    tx = [{"Put": put}] + _card_updates(table.name, user_id, _card_delta(old, new))
-    try:
-        table.meta.client.transact_write_items(TransactItems=tx)
-    except ClientError as e:
-        if e.response["Error"]["Code"] == "TransactionCanceledException":
-            reasons = _cancel_reasons(e)
-            if only_if_new and reasons and reasons[0] == "ConditionalCheckFailed":
-                return False
-            if "ConditionalCheckFailed" in reasons[1:]:
-                raise HTTPException(422, "unknown credit card")
-        raise
-    return True
+        stmt = stmt.on_conflict_do_nothing(index_elements=["id"])
+    row = _one(conn.execute(stmt.returning(expenses)))
+    if row is None:
+        return None
+    for cid, delta in _card_delta(None, row).items():
+        adjust_card(conn, user_id, cid, delta)
+    return row
 
 
-def remove_expense(user_id: str, old: dict) -> None:
-    table = get_table()
-    tx = [{
-        "Delete": {
-            "TableName": table.name,
-            "Key": {"PK": old["PK"], "SK": old["SK"]},
-            "ConditionExpression": "attribute_exists(PK)",
-        }
-    }] + _card_updates(table.name, user_id, _card_delta(old, None))
-    try:
-        table.meta.client.transact_write_items(TransactItems=tx)
-    except ClientError as e:
-        if e.response["Error"]["Code"] == "TransactionCanceledException":
-            raise HTTPException(404, "Expense not found")
-        raise
+def update_expense(conn: Connection, user_id: str, old: dict, new: dict) -> dict:
+    values = {k: v for k, v in new.items() if k not in ("id", "user_id", "recurring_id", "loan_id")}
+    row = _one(conn.execute(
+        update(expenses).where(expenses.c.id == old["id"], expenses.c.user_id == user_id)
+        .values(**values, updated_at=func.now()).returning(expenses)
+    ))
+    for cid, delta in _card_delta(old, row).items():
+        adjust_card(conn, user_id, cid, delta)
+    return row
 
 
-def expense_out(item: dict) -> dict:
+def delete_expense(conn: Connection, user_id: str, old: dict) -> None:
+    conn.execute(expenses.delete().where(expenses.c.id == old["id"], expenses.c.user_id == user_id))
+    for cid, delta in _card_delta(old, None).items():
+        adjust_card(conn, user_id, cid, delta)
+
+
+def expense_out(row: dict) -> dict:
     return {
-        "id": item["id"],
-        "amount": to_rupees(item["amount_paise"]),
-        "date": item["date"],
-        "category": item["category"],
-        "note": item.get("note", ""),
-        "payment_method": item.get("payment_method"),
-        "card_id": item.get("card_id"),
-        "has_receipt": bool(item.get("receipt_key")),
-        "recurring_id": item.get("recurring_id"),
-        "loan_id": item.get("loan_id"),
-        "created_at": item.get("created_at"),
+        "id": row["id"],
+        "amount": to_rupees(row["amount_paise"]),
+        "date": _iso(row["date"]),
+        "category": row["category"],
+        "note": row.get("note") or "",
+        "payment_method": row.get("payment_method"),
+        "card_id": row.get("card_id"),
+        "recurring_id": row.get("recurring_id"),
+        "loan_id": row.get("loan_id"),
+        "created_at": _iso(row.get("created_at")),
     }
 
 
-def get_expense(user_id: str, expense_id: str) -> dict:
-    item = get_table().get_item(Key={"PK": user_pk(user_id), "SK": f"EXP#{expense_id}"}).get("Item")
-    if not item:
+def get_expense(conn: Connection, user_id: str, expense_id: str, *, lock: bool = False) -> dict:
+    q = select(expenses).where(expenses.c.id == expense_id, expenses.c.user_id == user_id)
+    if lock:
+        q = q.with_for_update()
+    row = _one(conn.execute(q))
+    if not row:
         raise HTTPException(404, "Expense not found")
-    return item
+    return row
 
 
-def query_expenses(user_id: str, start_date: str, end_date: str) -> list[dict]:
-    """All of a user's expenses with start_date <= date <= end_date (YYYY-MM-DD, inclusive)."""
-    return query_all(
-        IndexName="ByDate",
-        KeyConditionExpression=Key("PK").eq(user_pk(user_id))
-        & Key("date_sk").between(start_date, f"{end_date}#~"),
-    )
-
-
-def query_months(user_id: str, start_month: str, end_month: str) -> list[dict]:
-    return query_expenses(user_id, f"{start_month}-01", f"{end_month}-31")
-
-
-def expenses_with_category(user_id: str, category: str) -> list[dict]:
-    return query_all(
-        KeyConditionExpression=Key("PK").eq(user_pk(user_id)) & Key("SK").begins_with("EXP#"),
-        FilterExpression=Attr("category").eq(category),
-    )
+def query_months(conn: Connection, user_id: str, start_month: str, end_month: str) -> list[dict]:
+    start = dt.date.fromisoformat(f"{start_month}-01")
+    end = dt.date.fromisoformat(f"{end_month}-{days_in_month(end_month):02d}")
+    return _rows(conn.execute(
+        select(expenses)
+        .where(expenses.c.user_id == user_id, expenses.c.date >= start, expenses.c.date <= end)
+        .order_by(expenses.c.date.desc(), expenses.c.created_at.desc())
+    ))
 
 
 # ======================= budgets =======================
-def load_budgets(user_id: str) -> dict[str, int]:
-    return {i["category"]: int(i["amount_paise"]) for i in _items(user_id, "BUDGET#")}
+def load_budgets(conn: Connection, user_id: str) -> dict[str, int]:
+    rows = conn.execute(select(budgets.c.category, budgets.c.amount_paise).where(budgets.c.user_id == user_id))
+    return {r.category: int(r.amount_paise) for r in rows}
 
 
 # ======================= aggregation =======================
@@ -276,12 +235,12 @@ def aggregate(items: list[dict]) -> dict:
     return {"by_cat": by_cat, "by_pay": by_pay}
 
 
-def payment_rows(by_pay: dict[str, list[int]], cards: dict[str, dict]) -> list[dict]:
+def payment_rows(by_pay: dict[str, list[int]], cards_by_id: dict[str, dict]) -> list[dict]:
     rows = []
     for key, (total, count) in by_pay.items():
         if key.startswith("card:"):
             cid = key[5:]
-            card = cards.get(cid)
+            card = cards_by_id.get(cid)
             rows.append({
                 "key": key, "method": CREDIT_CARD, "card_id": cid,
                 "label": card["name"] if card else "Removed card",
@@ -317,7 +276,7 @@ def recurring_out(rec: dict, td: dt.date | None = None) -> dict:
         "id": rec["id"],
         "amount": to_rupees(rec["amount_paise"]),
         "category": rec["category"],
-        "note": rec.get("note", ""),
+        "note": rec.get("note") or "",
         "payment_method": rec.get("payment_method"),
         "card_id": rec.get("card_id"),
         "day_of_month": int(rec["day_of_month"]),
@@ -329,15 +288,18 @@ def recurring_out(rec: dict, td: dt.date | None = None) -> dict:
     }
 
 
-def list_recurring(user_id: str) -> list[dict]:
-    return _items(user_id, "REC#")
+def list_recurring(conn: Connection, user_id: str, *, lock: bool = False) -> list[dict]:
+    q = select(recurring).where(recurring.c.user_id == user_id).order_by(recurring.c.created_at)
+    if lock:
+        q = q.with_for_update()
+    return _rows(conn.execute(q))
 
 
-def _sync_recurring(user_id: str, td: dt.date) -> int:
+def _sync_recurring(conn: Connection, user_id: str, td: dt.date) -> int:
     cur = td.strftime("%Y-%m")
-    table = get_table()
     created = 0
-    for rec in list_recurring(user_id):
+    # FOR UPDATE: two requests syncing at once can't both generate the same month
+    for rec in list_recurring(conn, user_id, lock=True):
         if not rec.get("active", True):
             continue
         last_gen = rec.get("last_generated_month")
@@ -350,50 +312,56 @@ def _sync_recurring(user_id: str, td: dt.date) -> int:
             day = min(int(rec["day_of_month"]), days_in_month(month))
             if month == cur and td.day < day:
                 break
-            item = build_expense_item(
+            item = build_expense(
                 user_id, f"rec{rec['id']}{month.replace('-', '')}",
                 amount_paise=int(rec["amount_paise"]),
                 date=f"{month}-{day:02d}",
                 category=rec["category"],
-                note=rec.get("note", ""),
+                note=rec.get("note") or "",
                 payment_method=rec.get("payment_method"),
                 card_id=rec.get("card_id"),
                 recurring_id=rec["id"],
             )
-            created += save_expense(user_id, item, only_if_new=True)
+            created += insert_expense(conn, user_id, item, only_if_new=True) is not None
             done_upto = month
         if done_upto:
-            _mark(table, rec, "last_generated_month", done_upto)
+            conn.execute(update(recurring).where(recurring.c.id == rec["id"])
+                         .values(last_generated_month=done_upto))
     return created
 
 
-def _mark(table, item: dict, field: str, value: str) -> None:
-    try:
-        table.update_item(
-            Key={"PK": item["PK"], "SK": item["SK"]},
-            UpdateExpression=f"SET {field} = :v",
-            ConditionExpression="attribute_exists(PK)",
-            ExpressionAttributeValues={":v": value},
-        )
-    except ClientError as e:  # deleted concurrently - fine
-        log.warning("could not update %s: %s", item["SK"], e)
-
-
 # ======================= loans & borrowings =======================
-def list_loans(user_id: str) -> list[dict]:
-    return _items(user_id, "LOAN#")
+def list_loans(conn: Connection, user_id: str, *, lock: bool = False) -> list[dict]:
+    q = select(loans).where(loans.c.user_id == user_id).order_by(loans.c.created_at)
+    if lock:
+        q = q.with_for_update()
+    return _rows(conn.execute(q))
 
 
-def get_loan(user_id: str, loan_id: str) -> dict:
-    item = get_table().get_item(Key={"PK": user_pk(user_id), "SK": f"LOAN#{loan_id}"}).get("Item")
-    if not item:
+def get_loan(conn: Connection, user_id: str, loan_id: str) -> dict:
+    row = _one(conn.execute(select(loans).where(loans.c.id == loan_id, loans.c.user_id == user_id)))
+    if not row:
         raise HTTPException(404, "Loan not found")
-    return item
+    return row
+
+
+def repayments_for(conn: Connection, user_id: str, loan_ids: list[str]) -> dict[str, list[dict]]:
+    out: dict[str, list[dict]] = defaultdict(list)
+    if not loan_ids:
+        return out
+    rows = _rows(conn.execute(
+        select(loan_repayments)
+        .where(loan_repayments.c.user_id == user_id, loan_repayments.c.loan_id.in_(loan_ids))
+        .order_by(loan_repayments.c.date, loan_repayments.c.created_at)
+    ))
+    for r in rows:
+        out[r["loan_id"]].append(r)
+    return out
 
 
 def emi_dates(loan: dict) -> list[dt.date]:
     """First EMI on first_emi_date, then on emi_day of each following month."""
-    first = dt.date.fromisoformat(loan["first_emi_date"])
+    first: dt.date = loan["first_emi_date"]
     first_month = first.strftime("%Y-%m")
     out = [first]
     for i in range(1, int(loan["emi_count"])):
@@ -402,21 +370,20 @@ def emi_dates(loan: dict) -> list[dt.date]:
     return out
 
 
-def loan_out(loan: dict, td: dt.date | None = None) -> dict:
+def loan_out(loan: dict, repayments: list[dict], td: dt.date | None = None) -> dict:
     td = td or today()
     principal = int(loan["principal_paise"])
-    repayments = sorted(loan.get("repayments", []), key=lambda r: r["date"])
     extra_paid = sum(int(r["amount_paise"]) for r in repayments)
     out = {
         "id": loan["id"],
         "kind": loan["kind"],
         "lender": loan["lender"],
-        "taken_by": loan.get("taken_by", ""),
+        "taken_by": loan.get("taken_by") or "",
         "principal": to_rupees(principal),
-        "note": loan.get("note", ""),
-        "taken_on": loan.get("taken_on"),
+        "note": loan.get("note") or "",
+        "taken_on": _iso(loan.get("taken_on")),
         "repayments": [
-            {"id": r["id"], "amount": to_rupees(r["amount_paise"]), "date": r["date"], "note": r.get("note", "")}
+            {"id": r["id"], "amount": to_rupees(r["amount_paise"]), "date": _iso(r["date"]), "note": r.get("note") or ""}
             for r in repayments
         ],
         "interest_rate": None, "total_interest": None, "installment": None, "emi_day": None,
@@ -434,7 +401,7 @@ def loan_out(loan: dict, td: dt.date | None = None) -> dict:
             interest = max(0, inst * count - principal)
         dates = emi_dates(loan)
         scheduled = sum(1 for d in dates if d <= td)
-        paid = max(0, min(count, scheduled + int(loan.get("emi_adjustment", 0))))
+        paid = max(0, min(count, scheduled + int(loan.get("emi_adjustment") or 0)))
         total_paid = inst * paid + extra_paid
         remaining = max(0, principal + interest - total_paid)
         upcoming = [d for d in dates if d > td]
@@ -444,8 +411,8 @@ def loan_out(loan: dict, td: dt.date | None = None) -> dict:
             "installment": to_rupees(inst),
             "emi_day": int(loan["emi_day"]),
             "emi_count": count,
-            "first_emi_date": loan["first_emi_date"],
-            "emi_adjustment": int(loan.get("emi_adjustment", 0)),
+            "first_emi_date": _iso(loan["first_emi_date"]),
+            "emi_adjustment": int(loan.get("emi_adjustment") or 0),
             "insurance": bool(loan.get("insurance")),
             "log_emis_as_expenses": bool(loan.get("log_emis_as_expenses")),
             "emis_paid": paid,
@@ -468,42 +435,40 @@ def loan_out(loan: dict, td: dt.date | None = None) -> dict:
     return out
 
 
-def _sync_loan_emis(user_id: str, td: dt.date) -> int:
+def _sync_loan_emis(conn: Connection, user_id: str, td: dt.date) -> int:
     """For loans with `log_emis_as_expenses`, add each EMI to expenses on its date
     (only from the day the option was switched on, never back-filled)."""
-    table = get_table()
     created = 0
-    for loan in list_loans(user_id):
+    for loan in list_loans(conn, user_id, lock=True):
         if loan["kind"] != "loan" or not loan.get("log_emis_as_expenses"):
             continue
-        start = loan.get("emi_log_from") or td.isoformat()
+        start = loan.get("emi_log_from") or td
         last = loan.get("last_logged_emi")
         done = None
         for d in emi_dates(loan):
-            iso = d.isoformat()
-            if iso < start or (last and iso <= last):
+            if d < start or (last and d <= last):
                 continue
             if d > td:
                 break
-            item = build_expense_item(
-                user_id, f"emi{loan['id']}{iso.replace('-', '')}",
+            item = build_expense(
+                user_id, f"emi{loan['id']}{d.strftime('%Y%m%d')}",
                 amount_paise=int(loan["installment_paise"]),
-                date=iso,
+                date=d,
                 category="emi",
                 note=f"{loan['lender']} EMI",
                 payment_method=loan.get("payment_method"),
                 card_id=loan.get("card_id"),
                 loan_id=loan["id"],
             )
-            created += save_expense(user_id, item, only_if_new=True)
-            done = iso
+            created += insert_expense(conn, user_id, item, only_if_new=True) is not None
+            done = d
         if done:
-            _mark(table, loan, "last_logged_emi", done)
+            conn.execute(update(loans).where(loans.c.id == loan["id"]).values(last_logged_emi=done))
     return created
 
 
 # ======================= auto-generated expenses =======================
-def sync_auto(user_id: str, td: dt.date | None = None) -> int:
+def sync_auto(conn: Connection, user_id: str, td: dt.date | None = None) -> int:
     """Add any recurring expenses / loan EMIs that have fallen due.
 
     Runs whenever the user's expenses are read, so there is no scheduler to pay for.
@@ -511,4 +476,17 @@ def sync_auto(user_id: str, td: dt.date | None = None) -> int:
     markers stop a deleted occurrence from being re-created.
     """
     td = td or today()
-    return _sync_recurring(user_id, td) + _sync_loan_emis(user_id, td)
+    return _sync_recurring(conn, user_id, td) + _sync_loan_emis(conn, user_id, td)
+
+
+def card_month_spend(conn: Connection, user_id: str, month: str) -> dict[str, dict]:
+    start = dt.date.fromisoformat(f"{month}-01")
+    end = dt.date.fromisoformat(f"{month}-{days_in_month(month):02d}")
+    rows = conn.execute(
+        select(expenses.c.card_id, func.sum(expenses.c.amount_paise), func.count())
+        .where(and_(expenses.c.user_id == user_id, expenses.c.payment_method == CREDIT_CARD,
+                    expenses.c.card_id.is_not(None), expenses.c.date >= start, expenses.c.date <= end))
+        .group_by(expenses.c.card_id)
+    )
+    return {cid: {"total": int(total), "count": int(n)} for cid, total, n in rows}
+

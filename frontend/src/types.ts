@@ -71,7 +71,6 @@ export interface Expense extends Payment {
   date: string
   category: string
   note: string
-  has_receipt: boolean
   recurring_id: string | null
   loan_id: string | null
   created_at: string | null

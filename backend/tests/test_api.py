@@ -1,7 +1,4 @@
 import datetime as dt
-import os
-
-import boto3
 
 from app import services
 from tests.conftest import register
@@ -39,7 +36,7 @@ def test_requires_auth(client):
 # ---------- expenses ----------
 def test_expense_crud_and_month_filter(client, auth):
     e = add(client, auth)
-    assert e["amount"] == 250.5 and e["has_receipt"] is False
+    assert e["amount"] == 250.5
     add(client, auth, date="2026-09-30", amount=100, category="fuel")
 
     oct_ = client.get("/api/expenses?month=2026-10", headers=auth).json()
@@ -153,40 +150,6 @@ def test_recurring_end_month_validation(client, auth):
     assert r.status_code == 422
 
 
-# ---------- receipts ----------
-def test_receipt_flow(client, auth):
-    e = add(client, auth)
-    r = client.post(f"/api/expenses/{e['id']}/receipt/upload-url", headers=auth,
-                    json={"content_type": "image/jpeg"})
-    assert r.status_code == 200, r.text
-    up = r.json()
-    assert up["fields"]["key"] == up["key"]
-
-    # key for someone else's expense is rejected
-    assert client.put(f"/api/expenses/{e['id']}/receipt", headers=auth,
-                      json={"key": "receipts/other/x/y.jpg"}).status_code == 400
-    # not uploaded yet
-    assert client.put(f"/api/expenses/{e['id']}/receipt", headers=auth,
-                      json={"key": up["key"]}).status_code == 400
-
-    s3 = boto3.client("s3")
-    bucket = os.environ["RECEIPTS_BUCKET"]
-    s3.put_object(Bucket=bucket, Key=up["key"], Body=b"jpeg-bytes")
-    r = client.put(f"/api/expenses/{e['id']}/receipt", headers=auth, json={"key": up["key"]})
-    assert r.json()["has_receipt"] is True
-    assert "X-Amz-Signature" in client.get(f"/api/expenses/{e['id']}/receipt", headers=auth).json()["url"]
-
-    client.delete(f"/api/expenses/{e['id']}", headers=auth)
-    assert s3.list_objects_v2(Bucket=bucket).get("KeyCount") == 0
-
-
-def test_bad_receipt_type(client, auth):
-    e = add(client, auth)
-    r = client.post(f"/api/expenses/{e['id']}/receipt/upload-url", headers=auth,
-                    json={"content_type": "text/html"})
-    assert r.status_code == 422
-
-
 # ---------- export ----------
 def test_export_csv(client, auth):
     add(client, auth, amount=120, note="Tea, samosa", date="2026-10-03")
@@ -197,7 +160,7 @@ def test_export_csv(client, auth):
     lines = r.text.lstrip("﻿").strip().splitlines()
     assert lines[0].startswith("Date,Category,Amount (INR)")
     assert lines[1].startswith("2026-09-03,Transport,80.00")
-    assert lines[2] == '2026-10-03,Food & Dining,120.00,"Tea, samosa",Google Pay,,,'
+    assert lines[2] == '2026-10-03,Food & Dining,120.00,"Tea, samosa",Google Pay,,'
     assert client.get("/api/export?start=2026-10&end=2026-09", headers=auth).status_code == 422
 
 

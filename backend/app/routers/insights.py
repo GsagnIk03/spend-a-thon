@@ -3,8 +3,10 @@ import io
 from collections import defaultdict
 
 from fastapi import APIRouter, Depends, HTTPException, Response
+from sqlalchemy import Connection
 
 from ..constants import CREDIT_CARD, MAX_RANGE_MONTHS, PAYMENT_METHODS
+from ..db import get_db
 from ..security import current_user_id
 from ..services import (
     aggregate, all_categories, card_out, category_labels, expense_out, list_cards, load_budgets,
@@ -26,35 +28,36 @@ def _range(start: str | None, end: str | None) -> tuple[str, str]:
 
 
 @router.get("/meta")
-def meta(user_id: str = Depends(current_user_id)):
+def meta(user_id: str = Depends(current_user_id), conn: Connection = Depends(get_db)):
     """Everything the UI needs for pickers and labels: categories (incl. custom), payment
     methods and credit cards (incl. archived, so old expenses can still be labelled)."""
     return {
-        "categories": all_categories(user_id),
+        "categories": all_categories(conn, user_id),
         "payment_methods": PAYMENT_METHODS,
-        "cards": [card_out(c) for c in list_cards(user_id)],
+        "cards": [card_out(c) for c in list_cards(conn, user_id)],
     }
 
 
 @router.get("/summary")
-def summary(month: str | None = None, user_id: str = Depends(current_user_id)):
+def summary(month: str | None = None, user_id: str = Depends(current_user_id), conn: Connection = Depends(get_db)):
     month = require_month(month)
-    sync_auto(user_id)
+    sync_auto(conn, user_id)
     start = add_months(month, -5)
-    items = query_months(user_id, start, month)
-    budgets = load_budgets(user_id)
+    items = query_months(conn, user_id, start, month)
+    budgets = load_budgets(conn, user_id)
 
     trend = {m: 0 for m in month_range(start, month)}
     by_day = {f"{month}-{d:02d}": 0 for d in range(1, days_in_month(month) + 1)}
     this_month = []
     for it in items:
         paise = int(it["amount_paise"])
-        m = it["date"][:7]
+        iso = it["date"].isoformat()
+        m = iso[:7]
         if m in trend:
             trend[m] += paise
         if m == month:
             this_month.append(it)
-            by_day[it["date"]] += paise
+            by_day[iso] += paise
 
     agg = aggregate(this_month)
     cats = set(agg["by_cat"]) | set(budgets)
@@ -70,7 +73,7 @@ def summary(month: str | None = None, user_id: str = Depends(current_user_id)):
         ),
         key=lambda x: (-x["spent"], x["category"]),
     )
-    cards = {c["id"]: c for c in list_cards(user_id)}
+    cards = {c["id"]: c for c in list_cards(conn, user_id)}
     top = sorted(this_month, key=lambda i: int(i["amount_paise"]), reverse=True)[:5]
     budget_total = sum(budgets.values())
     return {
@@ -88,11 +91,12 @@ def summary(month: str | None = None, user_id: str = Depends(current_user_id)):
 
 
 @router.get("/insights")
-def insights(start: str | None = None, end: str | None = None, user_id: str = Depends(current_user_id)):
+def insights(start: str | None = None, end: str | None = None, user_id: str = Depends(current_user_id),
+             conn: Connection = Depends(get_db)):
     """Spend per category and per payment method over a period, with month-by-month series."""
     start, end = _range(start, end)
-    sync_auto(user_id)
-    items = query_months(user_id, start, end)
+    sync_auto(conn, user_id)
+    items = query_months(conn, user_id, start, end)
     months = month_range(start, end)
     agg = aggregate(items)
     total = sum(int(i["amount_paise"]) for i in items)
@@ -102,12 +106,12 @@ def insights(start: str | None = None, end: str | None = None, user_id: str = De
     monthly = {m: 0 for m in months}
     for it in items:
         p = int(it["amount_paise"])
-        m = it["date"][:7]
+        m = it["date"].isoformat()[:7]
         monthly[m] += p
         cat_monthly[it["category"]][m] += p
         pay_monthly[payment_key(it)][m] += p
 
-    cards = {c["id"]: c for c in list_cards(user_id)}
+    cards = {c["id"]: c for c in list_cards(conn, user_id)}
     by_category = sorted(
         (
             {
@@ -127,11 +131,11 @@ def insights(start: str | None = None, end: str | None = None, user_id: str = De
         row["share"] = round(row["total"] / to_rupees(total) * 100, 1) if total else 0
         row["monthly"] = [{"month": m, "total": to_rupees(v)} for m, v in pay_monthly[row["key"]].items()]
 
-    groups = defaultdict(lambda: [0, 0])  # rolled up: Cash / UPI apps / Credit cards / ...
-    for row in by_payment:
-        g = row["method"]
-        groups[g][0] += round(row["total"] * 100)
-        groups[g][1] += row["count"]
+    groups: dict[str, list[int]] = defaultdict(lambda: [0, 0])  # rolled up: Cash / Credit card / ...
+    for key, (t, n) in agg["by_pay"].items():
+        g = CREDIT_CARD if key.startswith("card:") else key
+        groups[g][0] += t
+        groups[g][1] += n
 
     return {
         "start": start,
@@ -152,28 +156,27 @@ def insights(start: str | None = None, end: str | None = None, user_id: str = De
 
 @router.get("/export")
 def export_csv(start: str | None = None, end: str | None = None,
-               user_id: str = Depends(current_user_id)):
+               user_id: str = Depends(current_user_id), conn: Connection = Depends(get_db)):
     start, end = _range(start, end)
-    sync_auto(user_id)
-    items = sorted(query_months(user_id, start, end), key=lambda i: (i["date"], i.get("created_at", "")))
-    labels = category_labels(user_id)
-    cards = {c["id"]: c["name"] for c in list_cards(user_id)}
+    sync_auto(conn, user_id)
+    items = sorted(query_months(conn, user_id, start, end), key=lambda i: (i["date"], i["created_at"]))
+    labels = category_labels(conn, user_id)
+    cards = {c["id"]: c["name"] for c in list_cards(conn, user_id)}
 
     buf = io.StringIO()
     buf.write("﻿")  # BOM so Excel opens ₹ and emoji correctly
     w = csv.writer(buf)
-    w.writerow(["Date", "Category", "Amount (INR)", "Note", "Payment method", "Card", "Recurring", "Receipt"])
+    w.writerow(["Date", "Category", "Amount (INR)", "Note", "Payment method", "Card", "Auto-added"])
     for i in items:
-        card = cards.get(i.get("card_id", ""), "") if i.get("payment_method") == CREDIT_CARD else ""
+        card = cards.get(i.get("card_id") or "", "") if i.get("payment_method") == CREDIT_CARD else ""
         w.writerow([
-            i["date"],
+            i["date"].isoformat(),
             labels.get(i["category"], i["category"]),
             f"{to_rupees(i['amount_paise']):.2f}",
-            i.get("note", ""),
-            i.get("payment_method", ""),
+            i.get("note") or "",
+            i.get("payment_method") or "",
             card,
             "Yes" if i.get("recurring_id") or i.get("loan_id") else "",
-            "Yes" if i.get("receipt_key") else "",
         ])
     name = f"expenses_{start}" + (f"_to_{end}" if end != start else "") + ".csv"
     return Response(

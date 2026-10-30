@@ -31,13 +31,4 @@ CATEGORY_COLORS = [
 ]
 CARD_COLORS = ["#0f766e", "#1e3a8a", "#7c2d12", "#581c87", "#111827", "#9f1239", "#155e75", "#3f6212"]
 
-RECEIPT_TYPES = {
-    "image/jpeg": "jpg",
-    "image/png": "png",
-    "image/webp": "webp",
-    "image/heic": "heic",
-    "application/pdf": "pdf",
-}
-RECEIPT_MAX_BYTES = 5 * 1024 * 1024
-
 MAX_RANGE_MONTHS = 24
